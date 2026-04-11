@@ -1,0 +1,99 @@
+# =============================================================
+# PIPELINE CI/CD - GitHub Actions
+# =============================================================
+# Ce pipeline se déclenche automatiquement à chaque push
+# sur la branche "main". Il vérifie que l'image Docker
+# se build correctement (intégration continue).
+# =============================================================
+
+name: Build & Deploy Metabase TP
+
+on:
+  push:
+    branches:
+      # Le pipeline se déclenche uniquement sur la branche main
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # =============================================================
+  # JOB 1 : BUILD DE L'IMAGE DOCKER
+  # Vérifie que le Dockerfile est valide et que l'image se build
+  # =============================================================
+  build:
+    name: Build Image Docker
+    # On utilise un runner Ubuntu (Linux) fourni par GitHub
+    runs-on: ubuntu-latest
+
+    steps:
+      # Étape 1 : Récupère le code source depuis le dépôt GitHub
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      # Étape 2 : Configure Docker Buildx
+      # Buildx est le builder moderne de Docker, supporte
+      # le cache et le multi-platform
+      - name: Configurer Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Étape 3 : Build de l'image custom metabase-tp:1.0
+      # "--load" charge l'image dans le daemon Docker local
+      # pour pouvoir la tester ensuite
+      - name: Build de l'image metabase-tp:1.0
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false        # On ne push pas sur un registry, juste un build local
+          tags: metabase-tp:1.0
+          cache-from: type=gha   # Utilise le cache GitHub Actions pour accélérer les builds
+          cache-to: type=gha,mode=max
+
+      # Étape 4 : Vérifie que l'image a bien été créée
+      # et affiche ses métadonnées (labels, taille, etc.)
+      - name: Vérifier l'image buildée
+        run: |
+          docker images metabase-tp
+          echo "✅ Image metabase-tp:1.0 buildée avec succès"
+
+  # =============================================================
+  # JOB 2 : VALIDATION DU DOCKER COMPOSE
+  # Vérifie que le docker-compose.yml est syntaxiquement correct
+  # =============================================================
+  validate:
+    name: Valider docker-compose.yml
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      # Crée un .env minimal pour que docker compose config
+      # puisse résoudre les variables sans erreur
+      - name: Créer un .env de test
+        run: |
+          cat > .env << EOF
+          POSTGRES_DB=metabase_tp
+          POSTGRES_USER=metabase_user
+          POSTGRES_PASSWORD=test_password
+          MB_SITE_URL=https://example.com
+          MB_SITE_NAME=Test
+          MB_ADMIN_EMAIL=test@test.com
+          MB_ADMIN_PASSWORD=test_password
+          MB_DB_TYPE=postgres
+          MB_DB_DBNAME=metabase_tp
+          MB_DB_PORT=5432
+          MB_DB_HOST=postgres-db
+          MB_DB_USER=metabase_user
+          MB_DB_PASS=test_password
+          MB_APPLICATION_DB_AUTO_MIGRATE=true
+          JAVA_TIMEZONE=Africa/Douala
+          EOF
+
+      # Valide la syntaxe du docker-compose.yml
+      # "docker compose config" résout les variables et vérifie la structure
+      - name: Valider la syntaxe du docker-compose.yml
+        run: |
+          docker compose config
+          echo "✅ docker-compose.yml valide"

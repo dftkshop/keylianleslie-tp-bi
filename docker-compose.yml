@@ -1,0 +1,173 @@
+services:
+  traefik:
+    image: traefik:v2.11
+    container_name: traefik
+    restart: unless-stopped
+
+    # Sur Windows + Docker Desktop, "host.docker.internal" permet à Traefik
+    # de communiquer avec le daemon Docker qui tourne sur l'hôte Windows
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Port 80 : reçoit le challenge HTTP-01 de Let's Encrypt + redirige vers HTTPS
+    # Port 443 : trafic HTTPS sécurisé (Metabase)
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      # Accès en lecture seule au socket Docker pour détecter les conteneurs automatiquement
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Volume persistant pour stocker le certificat Let's Encrypt (acme.json)
+      # IMPORTANT : si ce volume est supprimé, le certificat est perdu et Let's Encrypt
+      # va en générer un nouveau (limité à 5 par semaine par domaine !)
+      - traefik-certs:/letsencrypt
+
+    command:
+      # -------------------------------------------------------
+      # API & Dashboard Traefik
+      # -------------------------------------------------------
+      # On désactive le dashboard public non sécurisé (bonne pratique)
+      # En phase de debug tu peux repasser à true temporairement
+      - "--api.insecure=false"
+      - "--api.dashboard=false"
+
+      # -------------------------------------------------------
+      # Logs : indispensable pour débugger Let's Encrypt
+      # -------------------------------------------------------
+      # INFO = niveau standard, passe à DEBUG si tu veux tout voir
+      - "--log.level=INFO"
+      # Active les logs d'accès (chaque requête HTTP entrante est loggée)
+      - "--accesslog=true"
+
+      # -------------------------------------------------------
+      # Provider Docker
+      # -------------------------------------------------------
+      # Traefik surveille les conteneurs Docker pour configurer le routage automatiquement
+      - "--providers.docker=true"
+      # Sécurité : seuls les conteneurs avec le label "traefik.enable=true" sont exposés
+      - "--providers.docker.exposedbydefault=false"
+      # Sur Windows/Docker Desktop, on passe par TCP car le socket Unix n'est pas dispo nativement
+      # PRÉREQUIS : activer "Expose daemon on tcp://localhost:2375" dans Docker Desktop > Settings > General
+      - "--providers.docker.endpoint=tcp://host.docker.internal:2375"
+      # Réseau Docker dans lequel Traefik cherche les conteneurs à router
+      # Le nom suit le pattern : <nom_du_dossier_projet>_default
+      - "--providers.docker.network=tp-metabase_default"
+
+      # -------------------------------------------------------
+      # Entrypoints (points d'entrée réseau)
+      # -------------------------------------------------------
+      # "web" = port 80 HTTP
+      - "--entrypoints.web.address=:80"
+      # Redirection automatique de tout le trafic HTTP (port 80) vers HTTPS (port 443)
+      # "permanent=true" envoie un code 301 (redirection permanente) au navigateur
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entryPoint.permanent=true"
+      # "websecure" = port 443 HTTPS
+      - "--entrypoints.websecure.address=:443"
+
+      # -------------------------------------------------------
+      # Let's Encrypt (ACME) - Certificat SSL gratuit automatique
+      # -------------------------------------------------------
+      # Email utilisé pour les notifications Let's Encrypt (expiration, problèmes)
+      - "--certificatesresolvers.letsencrypt.acme.email=${MB_ADMIN_EMAIL}"
+      # Fichier JSON où Traefik stocke le certificat obtenu (dans le volume persistant)
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      # Méthode de validation : HTTP-01
+      # Let's Encrypt va faire une requête HTTP sur http://ton-domaine/.well-known/acme-challenge/...
+      # pour vérifier que tu contrôles bien le domaine → le port 80 DOIT être ouvert sur internet
+      - "--certificatesresolvers.letsencrypt.acme.httpChallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpChallenge.entryPoint=web"
+
+  postgres-db:
+    image: postgres:16
+    container_name: postgres-externe
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Monte le dossier init-db dans le répertoire spécial de PostgreSQL.
+      # Tout fichier .sql présent ici est exécuté automatiquement
+      # lors de la première initialisation de la base (volume vide).
+      # Ordre d'exécution : alphabétique → 01_init_data.sql en premier
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # pg_isready vérifie que PostgreSQL accepte les connexions
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s       # Vérifie toutes les 10 secondes
+      timeout: 5s         # Abandon si pas de réponse en 5s
+      retries: 5          # 5 échecs consécutifs = conteneur "unhealthy"
+      start_period: 20s   # Laisse 20s à PostgreSQL pour démarrer avant de commencer les checks
+
+  metabase:
+    # "build: ." dit à Docker Compose de construire l'image depuis le Dockerfile
+    # situé dans le dossier courant (là où se trouve ce docker-compose.yml)
+    build: .
+    # Nom et tag de l'image qui sera créée lors du build
+    # Convention : <nom-projet>:<version> → metabase-tp:1.0
+    image: metabase-tp:1.0
+    container_name: metabase-bi
+    restart: unless-stopped
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    environment:
+      MB_SITE_URL: ${MB_SITE_URL}
+      MB_SITE_NAME: ${MB_SITE_NAME}
+      MB_DB_TYPE: ${MB_DB_TYPE}
+      MB_DB_DBNAME: ${MB_DB_DBNAME}
+      MB_DB_PORT: ${MB_DB_PORT}
+      MB_DB_HOST: ${MB_DB_HOST}
+      MB_DB_USER: ${MB_DB_USER}
+      MB_DB_PASS: ${MB_DB_PASS}
+      MB_ADMIN_EMAIL: ${MB_ADMIN_EMAIL}
+      MB_ADMIN_PASSWORD: ${MB_ADMIN_PASSWORD}
+      MB_APPLICATION_DB_AUTO_MIGRATE: ${MB_APPLICATION_DB_AUTO_MIGRATE}
+      MB_JETTY_HOST: 0.0.0.0
+      JAVA_TIMEZONE: ${JAVA_TIMEZONE}
+    # Expose le port 3000 de Metabase directement sur la machine Windows
+    # Accès local via : http://localhost:3000
+    # Traefik reste configuré pour le jour où le réseau le permettra
+    ports:
+      - "3000:3000"
+    volumes:
+      - metabase-data:/metabase-data
+    labels:
+      # Active Traefik pour ce conteneur (obligatoire car exposedbydefault=false)
+      - "traefik.enable=true"
+
+      # Règle de routage : Traefik redirige vers ce conteneur uniquement si
+      # le nom de domaine de la requête correspond exactement à ce Host
+      - "traefik.http.routers.metabase.rule=Host(`keylianleslie-tp-bi.duckdns.org`)"
+
+      # Ce router écoute uniquement sur l'entrypoint HTTPS (port 443)
+      # Le port 80 est géré par la redirection définie dans Traefik (voir plus haut)
+      - "traefik.http.routers.metabase.entrypoints=websecure"
+
+      # Active TLS (HTTPS) sur ce router
+      - "traefik.http.routers.metabase.tls=true"
+
+      # Indique à Traefik quel resolver utiliser pour obtenir le certificat SSL
+      # "letsencrypt" correspond au nom défini dans --certificatesresolvers.letsencrypt.*
+      - "traefik.http.routers.metabase.tls.certresolver=letsencrypt"
+
+      # Port interne du conteneur Metabase sur lequel Traefik doit forwarder les requêtes
+      # Metabase écoute sur le port 3000 à l'intérieur du conteneur
+      - "traefik.http.services.metabase.loadbalancer.server.port=3000"
+    healthcheck:
+      # Vérifie que l'API Metabase répond correctement
+      # /api/health retourne {"status":"ok"} quand Metabase est prêt
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s       # Vérifie toutes les 30s (Metabase est lourd, inutile de surcharger)
+      timeout: 10s        # Abandon si pas de réponse en 10s
+      retries: 5          # 5 échecs = conteneur "unhealthy"
+      start_period: 120s  # Laisse 2 minutes à Metabase pour démarrer (JVM + migrations BD)
+
+volumes:
+  traefik-certs:
+  pgdata:
+  metabase-data:

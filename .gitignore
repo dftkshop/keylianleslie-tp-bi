@@ -1,0 +1,24 @@
+# =============================================================
+# FICHIERS SENSIBLES - Ne jamais pusher sur GitHub
+# =============================================================
+# Le .env contient les mots de passe et secrets du projet
+.env
+
+# Certificats Let's Encrypt générés par Traefik
+letsencrypt/
+
+# =============================================================
+# FICHIERS SYSTÈME
+# =============================================================
+# Windows
+Thumbs.db
+desktop.ini
+
+# VSCode
+.vscode/
+
+# =============================================================
+# DOCKER
+# =============================================================
+# Fichier de lock acme (certificats Traefik)
+acme.json
