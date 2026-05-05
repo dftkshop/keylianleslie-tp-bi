@@ -3,6 +3,11 @@ services:
     image: traefik:v2.11
     container_name: traefik
     restart: unless-stopped
+    # Traefik doit rester root car il accède au socket Docker
+    # et bind les ports 80/443 (ports privilégiés < 1024)
+    # C'est une exception justifiée et documentée
+    networks:
+      - default
 
     # Sur Windows + Docker Desktop, "host.docker.internal" permet à Traefik
     # de communiquer avec le daemon Docker qui tourne sur l'hôte Windows
@@ -84,6 +89,9 @@ services:
     image: postgres:16
     container_name: postgres-externe
     restart: unless-stopped
+    # L'image postgres:16 crée nativement l'utilisateur "postgres" (uid 999)
+    # On force l'exécution avec cet utilisateur non-root
+    user: "999:999"
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -104,14 +112,11 @@ services:
       start_period: 20s   # Laisse 20s à PostgreSQL pour démarrer avant de commencer les checks
 
   metabase:
-    # "build: ." dit à Docker Compose de construire l'image depuis le Dockerfile
-    # situé dans le dossier courant (là où se trouve ce docker-compose.yml)
     build: .
-    # Nom et tag de l'image qui sera créée lors du build
-    # Convention : <nom-projet>:<version> → metabase-tp:1.0
     image: metabase-tp:1.0
     container_name: metabase-bi
     restart: unless-stopped
+    user: "2000:2000"
     depends_on:
       postgres-db:
         condition: service_healthy
@@ -129,45 +134,88 @@ services:
       MB_APPLICATION_DB_AUTO_MIGRATE: ${MB_APPLICATION_DB_AUTO_MIGRATE}
       MB_JETTY_HOST: 0.0.0.0
       JAVA_TIMEZONE: ${JAVA_TIMEZONE}
-    # Expose le port 3000 de Metabase directement sur la machine Windows
-    # Accès local via : http://localhost:3000
-    # Traefik reste configuré pour le jour où le réseau le permettra
     ports:
       - "3000:3000"
     volumes:
       - metabase-data:/metabase-data
     labels:
-      # Active Traefik pour ce conteneur (obligatoire car exposedbydefault=false)
       - "traefik.enable=true"
-
-      # Règle de routage : Traefik redirige vers ce conteneur uniquement si
-      # le nom de domaine de la requête correspond exactement à ce Host
       - "traefik.http.routers.metabase.rule=Host(`keylianleslie-tp-bi.duckdns.org`)"
-
-      # Ce router écoute uniquement sur l'entrypoint HTTPS (port 443)
-      # Le port 80 est géré par la redirection définie dans Traefik (voir plus haut)
       - "traefik.http.routers.metabase.entrypoints=websecure"
-
-      # Active TLS (HTTPS) sur ce router
       - "traefik.http.routers.metabase.tls=true"
-
-      # Indique à Traefik quel resolver utiliser pour obtenir le certificat SSL
-      # "letsencrypt" correspond au nom défini dans --certificatesresolvers.letsencrypt.*
       - "traefik.http.routers.metabase.tls.certresolver=letsencrypt"
-
-      # Port interne du conteneur Metabase sur lequel Traefik doit forwarder les requêtes
-      # Metabase écoute sur le port 3000 à l'intérieur du conteneur
       - "traefik.http.services.metabase.loadbalancer.server.port=3000"
     healthcheck:
-      # Vérifie que l'API Metabase répond correctement
-      # /api/health retourne {"status":"ok"} quand Metabase est prêt
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
-      interval: 30s       # Vérifie toutes les 30s (Metabase est lourd, inutile de surcharger)
-      timeout: 10s        # Abandon si pas de réponse en 10s
-      retries: 5          # 5 échecs = conteneur "unhealthy"
-      start_period: 120s  # Laisse 2 minutes à Metabase pour démarrer (JVM + migrations BD)
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # =============================================================
+  # INSTANCE 2 DE METABASE - Load Balancing
+  # =============================================================
+  # Deuxième instance identique à la première.
+  # Traefik détecte automatiquement les deux conteneurs via leurs labels
+  # et distribue le trafic en round-robin entre metabase et metabase-2.
+  # Les deux partagent la même base PostgreSQL → données cohérentes.
+  # =============================================================
+  metabase-2:
+    build: .
+    image: metabase-tp:1.0
+    container_name: metabase-bi-2
+    restart: unless-stopped
+    user: "2000:2000"
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    environment:
+      MB_SITE_URL: ${MB_SITE_URL}
+      MB_SITE_NAME: ${MB_SITE_NAME}
+      MB_DB_TYPE: ${MB_DB_TYPE}
+      MB_DB_DBNAME: ${MB_DB_DBNAME}
+      MB_DB_PORT: ${MB_DB_PORT}
+      MB_DB_HOST: ${MB_DB_HOST}
+      MB_DB_USER: ${MB_DB_USER}
+      MB_DB_PASS: ${MB_DB_PASS}
+      MB_ADMIN_EMAIL: ${MB_ADMIN_EMAIL}
+      MB_ADMIN_PASSWORD: ${MB_ADMIN_PASSWORD}
+      # La migration ne doit tourner que sur une seule instance
+      # pour éviter les conflits de migration simultanée
+      MB_APPLICATION_DB_AUTO_MIGRATE: "false"
+      MB_JETTY_HOST: 0.0.0.0
+      JAVA_TIMEZONE: ${JAVA_TIMEZONE}
+    # Port différent pour éviter le conflit avec l'instance 1 en local
+    ports:
+      - "3001:3000"
+    volumes:
+      # Volume séparé pour les données propres à cette instance
+      - metabase-data-2:/metabase-data
+    labels:
+      - "traefik.enable=true"
+      # Même règle de routage que l'instance 1 → Traefik fait le load balancing
+      - "traefik.http.routers.metabase.rule=Host(`keylianleslie-tp-bi.duckdns.org`)"
+      - "traefik.http.routers.metabase.entrypoints=websecure"
+      - "traefik.http.routers.metabase.tls=true"
+      - "traefik.http.routers.metabase.tls.certresolver=letsencrypt"
+      # Même service Traefik → les deux instances sont dans le même pool de load balancing
+      - "traefik.http.services.metabase.loadbalancer.server.port=3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
 
 volumes:
   traefik-certs:
   pgdata:
   metabase-data:
+  # Volume dédié à la deuxième instance Metabase
+  metabase-data-2:
+
+networks:
+  default:
+    # Nom explicite du réseau pour éviter les surprises si le dossier est renommé
+    # Traefik utilise ce nom dans --providers.docker.network
+    name: tp-metabase_default

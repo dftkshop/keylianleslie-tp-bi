@@ -32,6 +32,15 @@ LABEL org.opencontainers.image.authors="kdjidawo@gmail.com"
 ENV MB_SITE_NAME="Institut Jean - TP BI Metabase"
 
 # =============================================================
+# UTILISATEUR NON-ROOT
+# =============================================================
+# L'image officielle Metabase définit déjà un utilisateur "metabase"
+# avec l'uid 2000. On s'assure qu'il est bien utilisé.
+# Cela empêche le processus Java de tourner en root dans le conteneur.
+# =============================================================
+USER 2000
+
+# =============================================================
 # PORT EXPOSÉ
 # =============================================================
 # Documente que ce conteneur écoute sur le port 3000.
